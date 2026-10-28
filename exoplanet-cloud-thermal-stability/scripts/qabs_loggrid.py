@@ -1,0 +1,384 @@
+# -*- coding: utf-8 -*-
+"""
+Qabs on log-spaced wavelength grids + wavelength-direction integration
+Packaged from the recovered 2026-04-28 source; see docs/RECOVERY_STATUS.md.
+-------------------------------------------------------------------------------
+What this script does
+  1) Builds a logarithmically spaced wavelength grid (within the measured range).
+  2) Interpolates n(λ), k(λ) onto that grid (PCHIP by default; linear optional).
+  3) Computes absorption efficiency Q_abs(λ; a) with miepython for given radii.
+  4) Integrates along wavelength: ∫Qabs dλ, ∫Qabs d ln λ, and optional Planck-weighted mean.
+  5) Saves spectra CSV,2 integrals CSV, and a PDF plot (and shows the plot).
+
+Inputs
+  - Optical constants files in data_dir: one per material, named "<Material>.dat"
+    with three columns: wavelength (μm), n, k. Lines starting with '#' are ignored.
+
+Outputs (per material)
+  - <save_prefix>_Qabs.csv        : columns [Wavelength (μm), Qabs_<a1>μm, ...]
+  - <save_prefix>_integrals.csv   : rows for each radius with integrals
+  - <save_prefix>_Qabs.pdf        : log–log plot of Qabs vs λ for all radii
+
+Key settings in this version
+  - Materials: 8 species
+      Al2O3, Fe, KCl, Mg2SiO4, MnS, Na2S, SiO2, ZnS
+  - Radii (μm): fixed set
+      0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100
+
+Change in this request
+  - Default wavelength resolution R is set to 700 (was 500).
+  - Output CSV name becomes like "Fe_logR700_Qabs.csv" via save_prefix = f"{material}_logR{R}".
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import argparse
+from typing import Iterable, Tuple, Optional, List, Dict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Mie and interpolation tools
+import miepython
+from scipy.interpolate import PchipInterpolator, interp1d
+from scipy.integrate import trapezoid
+from scipy.constants import h, c, k as k_B
+
+
+# ============================
+# Project defaults
+# ============================
+
+# 8 materials (your full set)
+ALL_MATERIALS_8 = ['Al2O3', 'Fe', 'KCl', 'Mg2SiO4', 'MnS', 'Na2S', 'SiO2', 'ZnS']
+
+# fixed radii list (μm)
+RADIUS_LIST_UM = [0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]
+
+# some materials have special filenames
+SPECIAL_FILES = {
+    'Mg2SiO4': 'Mg2SiO4_amorph_sol-gel.dat',
+    'SiO2':    'SiO2_alpha.dat',
+}
+
+
+# ============================
+# Utilities
+# ============================
+
+def _clean_xy_unique_sorted(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    sort_idx = np.argsort(x)
+    x, y = x[sort_idx], y[sort_idx]
+    unique_x, unique_idx = np.unique(x, return_index=True)
+    y_unique = y[unique_idx]
+    return unique_x, y_unique
+
+
+def build_log_grid(lmdata: np.ndarray, R: int,
+                   lmin: Optional[float] = None, lmax: Optional[float] = None,
+                   clip_to_data: bool = True) -> np.ndarray:
+    dmin, dmax = np.nanmin(lmdata), np.nanmax(lmdata)
+    if lmin is None:
+        lmin = dmin
+    if lmax is None:
+        lmax = dmax
+    if clip_to_data:
+        lmin = max(lmin, dmin)
+        lmax = min(lmax, dmax)
+    if not (lmax > lmin > 0):
+        raise ValueError(f"Bad grid bounds after clipping: lmin={lmin}, lmax={lmax}, data=[{dmin},{dmax}]")
+    return np.logspace(np.log10(lmin), np.log10(lmax), R)
+
+
+def make_interpolator(lmdata: np.ndarray, ydata: np.ndarray, method: str = 'pchip'):
+    x, y = _clean_xy_unique_sorted(np.asarray(lmdata), np.asarray(ydata))
+    if len(x) < 2:
+        raise ValueError("Not enough points to interpolate (need ≥2). Check your .dat file.")
+    if method.lower() == 'pchip':
+        return PchipInterpolator(x, y, extrapolate=False)
+    elif method.lower() == 'linear':
+        return interp1d(x, y, kind='linear', bounds_error=False, fill_value=np.nan, assume_sorted=True)
+    else:
+        raise ValueError("method must be 'pchip' or 'linear'")
+
+
+def planck_lambda(wavelength_um: np.ndarray, T: float) -> np.ndarray:
+    lam_m = np.asarray(wavelength_um) * 1e-6
+    a = 2.0 * h * c**2 / (lam_m**5)
+    b = h * c / (lam_m * k_B * T)
+    return a / np.expm1(b)
+
+
+def integrate_qabs(lmd: np.ndarray, qabs: np.ndarray, T: Optional[float] = None) -> Dict[str, float]:
+    lmd = np.asarray(lmd)
+    qabs = np.asarray(qabs)
+    mask = np.isfinite(lmd) & np.isfinite(qabs)
+    lmd = lmd[mask]
+    qabs = qabs[mask]
+    if len(lmd) < 2:
+        out = {'int_dlambda': np.nan, 'int_dlnlambda': np.nan}
+        if T is not None:
+            out['planck_weighted'] = np.nan
+        return out
+
+    int_dlambda = float(trapezoid(qabs, lmd))
+    int_dlnlambda = float(trapezoid(qabs, np.log(lmd)))
+
+    out = {
+        'int_dlambda': int_dlambda,
+        'int_dlnlambda': int_dlnlambda,
+    }
+    if T is not None:
+        B = planck_lambda(lmd, T)
+        num = trapezoid(qabs * B, lmd)
+        den = trapezoid(B, lmd)
+        out['planck_weighted'] = float(num / den) if den > 0 else np.nan
+    return out
+
+
+# ============================
+# Core calculation
+# ============================
+
+def compute_qabs_on_log_grid(
+    material: str,
+    data_dir: str,
+    radii_micron: Iterable[float],
+    R: int = 700,  # <-- changed default from 500 to 700 (ONLY change requested)
+    lmin: Optional[float] = None,
+    lmax: Optional[float] = None,
+    interp_method: str = 'pchip',
+    planck_T_list: Optional[List[float]] = None,
+    save_dir: Optional[str] = None,
+    make_plot: bool = True,
+    fixed_plot_xlim: Tuple[float, float] = (1e-1, 1e2),
+    fixed_plot_ylim: Tuple[float, float] = (1e-7, 1e1),
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+    # --- load optical constants ---
+    fname = SPECIAL_FILES.get(material, f"{material}.dat")
+    fpath = os.path.join(data_dir, fname)
+    if not os.path.exists(fpath):
+        raise FileNotFoundError(f"No such file: {fpath}")
+
+    data = np.loadtxt(fpath, comments='#')
+    if data.ndim != 2 or data.shape[1] < 3:
+        raise ValueError(f"Bad format in {fpath}: expected 3+ columns [λ(μm) n k]")
+    lmdata, ndata, kdata = data[:, 0], data[:, 1], data[:, 2]
+
+    # --- grid and interpolation ---
+    lmd = build_log_grid(lmdata, R=R, lmin=lmin, lmax=lmax, clip_to_data=True)
+    f_n = make_interpolator(lmdata, ndata, method=interp_method)
+    f_k = make_interpolator(lmdata, kdata, method=interp_method)
+    n = f_n(lmd)
+    k = f_k(lmd)
+
+    spectra_df = pd.DataFrame({'Wavelength (μm)': lmd})
+
+    # --- compute Qabs ---
+    radii_list = list(radii_micron)
+    for a_um in radii_list:
+        qabs = np.empty_like(lmd)
+
+        # miepython uses the same length unit for diameter and wavelength.
+        dia_um = 2.0 * a_um
+
+        for i, (lam_um, nn, kk) in enumerate(zip(lmd, n, k)):
+            if not (np.isfinite(nn) and np.isfinite(kk)):
+                qabs_i = np.nan
+            else:
+                try:
+                    qext, qsca, _, _ = miepython.efficiencies(
+                        complex(nn, -abs(kk)), dia_um, lam_um
+                    )
+                    qabs_i = qext - qsca
+                except Exception:
+                    qabs_i = np.nan
+            qabs[i] = qabs_i
+
+        spectra_df[f'Qabs_{a_um:g}μm'] = qabs
+
+    # --- integrals ---
+    rows = []
+    for a_um in radii_list:
+        qcol = spectra_df[f'Qabs_{a_um:g}μm'].values
+        base_ints = integrate_qabs(lmd, qcol, T=None)
+        row = {'Material': material, 'Radius (μm)': a_um, **base_ints}
+
+        if planck_T_list:
+            for T in planck_T_list:
+                val = integrate_qabs(lmd, qcol, T=T)['planck_weighted']
+                row[f'planck_weighted_T{int(T)}K'] = val
+
+        rows.append(row)
+
+    integrals_df = pd.DataFrame(rows)
+
+    # --- save ---
+    if save_dir is None:
+        save_dir = os.getcwd()
+    os.makedirs(save_dir, exist_ok=True)
+
+    save_prefix = os.path.join(save_dir, f"{material}_logR{R}")
+    spectra_df.to_csv(f"{save_prefix}_Qabs.csv", index=False)
+    integrals_df.to_csv(f"{save_prefix}_integrals.csv", index=False)
+
+    # --- plot ---
+    if make_plot:
+        plt.figure(figsize=(10, 7))
+        plt.xscale('log')
+        plt.yscale('log')
+
+        cmap = plt.get_cmap('plasma')
+        for i, a_um in enumerate(radii_list):
+            plt.plot(
+                spectra_df['Wavelength (μm)'],
+                spectra_df[f'Qabs_{a_um:g}μm'],
+                label=f'a = {a_um:g} μm',
+                linewidth=1.6,
+                color=cmap(i / max(1, (len(radii_list) - 1))),
+            )
+
+        plt.xlabel('Wavelength (μm)', fontsize=18)
+        plt.ylabel(r'Absorption Efficiency $Q_{abs}$', fontsize=18)
+        plt.title(f' Qabs {material} ', fontsize=20)
+
+        # Grid removed (no other changes)
+        plt.grid(False)
+
+        # Fixed axis ranges (as you requested)
+        plt.xlim(*fixed_plot_xlim)   # default: 1e-1 to 1e2 μm
+        plt.ylim(*fixed_plot_ylim)   # default: 1e-7 to 1e1
+
+        plt.legend(title='Particle Radius', fontsize=10, title_fontsize=11, loc='lower right')
+        plt.tight_layout()
+        plt.savefig(f"{save_prefix}_Qabs.pdf", format='pdf', dpi=300, bbox_inches='tight')
+        plt.show()
+        plt.close()
+
+    return spectra_df, integrals_df
+
+
+# ============================
+# CLI
+# ============================
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description='Qabs on log-spaced grid + wavelength integration')
+
+    # all 8 materials by default
+    p.add_argument('-m', '--materials', nargs='+', default=ALL_MATERIALS_8)
+
+    # fixed radii set by default (you can override via CLI if needed)
+    p.add_argument(
+        '-a', '--radii', nargs='+', type=float,
+        default=RADIUS_LIST_UM,
+        help='Particle radii [μm]. Default is the fixed set: 0.01 0.03 0.1 0.3 1 3 10 30 100'
+    )
+
+    # wavelength grid resolution
+    p.add_argument('-R', '--resolution', type=int, default=700)  # <-- changed default from 500 to 700
+    p.add_argument('--lmin', type=float, default=None)
+    p.add_argument('--lmax', type=float, default=None)
+
+    p.add_argument('--interp', choices=['pchip', 'linear'], default='pchip')
+    p.add_argument('--planck_T', nargs='*', type=float, default=None)
+
+    p.add_argument('--data_dir', type=str, default='.')
+    p.add_argument('--save_dir', type=str, default='.')
+    p.add_argument('--no_plot', action='store_true')
+
+    args, unknown = p.parse_known_args(argv)
+    if unknown:
+        print(f"[info] Ignored unknown CLI args: {unknown}")
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    radii = list(args.radii)
+
+    print("\n=== Qabs log-grid run ===")
+    print(f"materials      : {args.materials}")
+    print(f"radii (μm)     : {radii}")
+    print(f"R (λ points)   : {args.resolution}")
+    print(f"λ range        : lmin={args.lmin}, lmax={args.lmax}")
+    print(f"interp         : {args.interp}")
+    print(f"planck_T       : {args.planck_T}")
+    print(f"data_dir       : {args.data_dir}")
+    print(f"save_dir       : {args.save_dir}\n")
+
+    failed = False
+    for mat in args.materials:
+        try:
+            spec_df, integ_df = compute_qabs_on_log_grid(
+                material=mat,
+                data_dir=args.data_dir,
+                radii_micron=radii,
+                R=args.resolution,
+                lmin=args.lmin,
+                lmax=args.lmax,
+                interp_method=args.interp,
+                planck_T_list=args.planck_T,
+                save_dir=args.save_dir,
+                make_plot=(not args.no_plot),
+            )
+        except Exception as e:
+            failed = True
+            print(f"[ERROR] {mat}: {e}")
+            continue
+
+        print(f"Integrals for {mat}:")
+        with pd.option_context('display.max_columns', None, 'display.width', 160):
+            print(integ_df)
+        print()
+
+    return 1 if failed else 0
+
+
+# ============================
+# Notebook helper
+# ============================
+
+def run(
+    materials: Optional[List[str]] = None,
+    radii: Optional[List[float]] = None,
+    resolution: int = 700,  # <-- changed default from 500 to 700
+    lmin: Optional[float] = None,
+    lmax: Optional[float] = None,
+    interp: str = 'pchip',
+    planck_T: Optional[List[float]] = None,
+    data_dir: str = '.',
+    save_dir: str = '.',
+    plot: bool = True,
+):
+    materials = materials or ALL_MATERIALS_8
+    radii = radii or RADIUS_LIST_UM
+
+    out = {}
+    for mat in materials:
+        out[mat] = compute_qabs_on_log_grid(
+            material=mat,
+            data_dir=data_dir,
+            radii_micron=radii,
+            R=resolution,
+            lmin=lmin,
+            lmax=lmax,
+            interp_method=interp,
+            planck_T_list=planck_T,
+            save_dir=save_dir,
+            make_plot=plot,
+        )
+    return out
+
+
+if __name__ == '__main__':
+    if 'ipykernel' in sys.modules:
+        sys.exit(main([]))
+    else:
+        sys.exit(main())

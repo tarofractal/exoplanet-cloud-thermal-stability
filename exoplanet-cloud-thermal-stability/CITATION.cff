@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "Please cite the associated paper when using this scientific work."
+type: software
+title: "Exoplanet cloud thermal stability: recovered research scripts"
+authors:
+  - family-names: Shefferson-Nagata
+    given-names: Taro M.
+  - family-names: Ohno
+    given-names: Kazumasa
+preferred-citation:
+  type: article
+  title: "Radiatively Controlled Thermal Stability of High-altitude Clouds in Exoplanetary Atmospheres"
+  authors:
+    - family-names: Shefferson-Nagata
+      given-names: Taro M.
+    - family-names: Ohno
+      given-names: Kazumasa
+  journal: The Astrophysical Journal
+  volume: "1005"
+  issue: "2"
+  start: "210"
+  year: 2026
+  doi: 10.3847/1538-4357/ae7d27
